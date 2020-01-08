@@ -1,0 +1,647 @@
+---
+title: "Predicting wine quality from physicochemical properties"
+author: "Bjoernar Tuftin"
+date: "October 25, 2019"
+output: pdf_document
+---
+
+```{r setup, include = FALSE, cache = FALSE}
+#Setting default options for code chunks
+knitr::opts_chunk$set(echo = FALSE)
+
+# Anchoring figures to their position in the markdown.
+# This doesn't work very well, but I haven't found
+# a better approach
+knitr::opts_chunk$set(fig.pos = 'htp', out.extra = '')
+
+# Some functions give output we don't want in the final report,
+# but which is good to have while working on the report and
+# debugging
+knitr::opts_chunk$set(warning = FALSE)
+knitr::opts_chunk$set(message = FALSE)
+
+# We don't want to rerun every chunk
+knitr::opts_chunk$set(cache=TRUE)
+
+# Change to FALSE before knitting to supress verbose output from SVDs
+tracking <- FALSE
+if(!require(tidyverse)) install.packages("tidyverse", repos = "http://cran.us.r-project.org")
+if(!require(caret)) install.packages("caret", repos = "http://cran.us.r-project.org")
+# For SVMLinear
+if(!require(kernlab)) install.packages("caret", repos = "http://cran.us.r-project.org")
+# For ordinalForest
+if(!require(ranger)) install.packages("ranger", repost = "http://cran.us.r-project.org")
+
+# dummy variable to edit and get knit to include setup when rerunning after an error
+x <- tibble(a = 1, b = 1) %>% select(a)
+rm(x)
+```
+
+
+
+# Introduction
+
+In this project I analyzed part of the *Wine Quality Data Set* (Cortez et al, 2009a) from the UCI Machine Learning Repository (Dua & Graff, 2019). The complete data set contains measurement data of physicochemical properties collected during certification of a number of red and white wines by the Viticulture Commission of the Vinho Verde region of Portugal, as well as expert assessments of those wines. The dataset stems from a project involving the commission and the University of Minho, Portugal. That project was a case study of a machine learning approach to model wine preferences based on measured physicochemical properties with results published as *‘Modeling wine preferences by data mining from physicochemical properties’* and available online as a preprint(Cortez et al, 2009b).
+
+They used three approaches, multiple regression (MR), neural network (NN) and support vector machine (SVM) to select features and train regression models and compared the resulting predictions using Regression Error Characteristics (REC) with varying tolerances, as well as Mean Absolute Deviation. Exploring the data and comparing naive approaches with the results they report, both through comparable measures and visualizations, I found their results unimpressive and wanted to see if improvements could be made if one took into consideration the high difference in prevalence and the fact that a quality assessment is ordinal rather than numeric data.
+
+I chose to compare my own results running a basic regression and a comparable SVM with the results using the `ordinalForest` function from the package of the same name. All modeling and training was run using functions in the `caret` package.
+
+The Ordinal Forest approach compensates for the ordinal nature of the data by creating multiple different ways to score the classes and choosing between them based on the accuracy of the result and it has a parameter for choosing between overall accuracy, accuracy by class, etc., which by default seeks to maximize the accuracy per class. Using regression approaches rather than straight classification does include the order of the ordinal data in the analysis, but under the assumption that a wine of quality 4 is somehow half as good as one in quality 8 and a 6 is twice as good as a 3.
+
+Cortez et al (p. 25, 2009b) appear to report their results as an average over their many bootstraps, but I chose to create a separate test set of 10 % for validation of the generalizability of the models and ran final validation tests on that set after completing training on the remaining data. My results are therefore not directly comparable to theirs.
+
+I compared the first algorithms by running predictions on the training set, and looking at overall accuracy when mapping regression results to one class and when accepting "one off" errors, and per class accuracy allowing "one off" errors. The overall results were similar to those reported by Cortez et al (p. 25, 2009b).
+
+For the Ordinal Forest algorithm though, predicting on the training set gave a near perfect fit. Looking at the mean accuracy reported for the bootstrap samples in training I still observed an improvement over that shown in predicting on the training set for the previous algorithms, but I feared overfitting and changed the number of trees in the final forest to try to mitigate that.
+
+Based on the error characteristics I was using I couldn't be certain it was successful, but it seemed like a plausible approach and I chose a forest size that only reduced the overall accuracy on the bootstraps by an amount withing a standard deviation of the best and then moved to validating the final models by predicting on the reserved test set. 
+
+This showed that the Ordinal Forest algorithm still outperformed the other algorithms. My attempts at reducing overfitting appeared to, at best, have had only a minuscule positive effect, but, as expected based on the results in training, they definitely represent a simplification of the model with insignificant loss of accuracy.
+
+# Method and Analysis
+
+```{r Downloading data and creating training and validation sets, include = FALSE}
+
+# It's unnecessary to download the data every time we run
+# the chunks, so we'll store it to a file and check
+# for that file when chunk is run again.
+
+f = "wine-quality-basic.RData"
+if (file.exists(f)) {
+  load(f)
+} else {
+
+  # Wine quality dataset from UCI Machine Learning Repository
+  # https://archive.ics.uci.edu/ml/datasets/Wine+Quality
+  # https://archive.ics.uci.edu/ml/machine-learning-databases/wine-quality/winequality-red.csv
+  
+  all_data <- read_delim("https://archive.ics.uci.edu/ml/machine-learning-databases/wine-quality/winequality-red.csv", delim = ";", col_types = )
+  
+  # We'll reserve 10% of the data to verify the algorithms at the end.
+  # If executing on an older version of R use:
+  # set.seed(1)
+  set.seed(1, sample.kind="Rounding")
+  
+  # To ensure the various qualities are represented in both training set and test set
+  # the quality column is duplicated as a factor.
+  all_data <- all_data %>% mutate(quality_factor = as.factor(quality))
+  
+  # Creating an index for 10% of the data based on that factor
+  test_index <- createDataPartition(y = all_data$quality_factor, times = 1, p = 0.1, list = FALSE)
+  training_data <- all_data[-test_index,]
+  test_data <- all_data[test_index,]
+  
+  # saving dataset to file 
+    save(all_data, training_data, test_data, file = f)
+}
+```
+## Data aquisition and cleaning
+
+The data required no cleaning as it was available as CSV-type file and could be readily imported directly to a data frame. In total the full dataset had `r nrow(all_data)` observations of `r ncol(all_data)` variables, each observation being a different wine. 
+
+## Data Exploration
+
+### The target variable
+
+I first split the data 90/10 into a training set of `r nrow(training_data)` observations and a test set with `r nrow(test_data)`. The variables are 11 physicochemical measurements and a quality assessment. According to Cortez et al (pp 6-7, 2009b) the quality assessment is the median of a score given by three experts grading on a scale from 1 to 10. As we can see from a plot of the distribution of scores (fig. 1), none of the red wines in the training sample were given a median score at the extremes of the scale. A plausible reason for this could be that the expert scores were never in perfect agreement on extreme scores. There's also the fact that these are measures from a certification board, and presumably a vintner would not bother with the expense of certification for a really bad wine, but that does not explain the lack of wines in the top categories.
+
+```{r Distribution of quality scores in the training data, fig.cap="Distribution of quality scores in the training data"}
+
+training_data %>%
+ggplot(aes(quality)) +
+  geom_bar()
+```
+
+The qualities of 3 and 8 have so low prevalence I checked closer and found that out of the total 1599 observations, there are only 10 of quality 3 and 18 of quality 8. Since the training/test split is done by quality there was only one observation of quality 3 and two of quality 8 in the test set.
+
+Fig. 1 also shows us that the vast majority of wines, over 80%, end up with a classification of 5 or 6, and that more than half of what remains is in classification 7. In table 2, Cortez et al. (p. 24, 2009b) report an accuracy of about 89% for red wines when counting "one offs" as hits, for all three approaches used, which does not seem very good considering predicting all 6s then gives you hits for all 5s, 6s and 7s, which would mean an accuracy of `r mean(training_data$quality %in% c(5,6,7))` on the training data.
+
+The per class sensitivity for such an approach would of course be 0 for 3s, 4s, and 8s, so it's not a fair comparison.
+
+### The predictors
+
+Since so much of the data is in classes 5 or 6 I decided to start by looking at the distribution for the predictors for those two classes. Fig. 2 is a box and whisker plot of the z-scores for each of the 11 predictors.
+
+```{r Normalizing the data and pivoting to long format}
+# Changing quality to factor to simplify call to mutate_if and change order
+# The order decides position in plot
+normalized <- training_data %>% mutate(quality = factor(as.character(quality), levels = c("3", "4", "5", "6", "7", "8"))) %>% mutate_if(is.numeric, scale)
+
+# Remove the other quality factor to simplify call to pivot_longer
+# pivot and change order of factors to get them alphabetically on y-axis
+normalized <- normalized[-13] %>% pivot_longer(-quality, names_to = "measurement", values_to = "value") %>% mutate(measurement = factor(measurement, rev(levels(as.factor(measurement)))))
+```
+
+```{r Variations in physicochemical measurements between qualities, fig.cap="Variation in physicochemical measurements between qualities"}
+normalized %>% filter(quality == 5 | quality == 6) %>%
+  ggplot(aes(measurement, value, fill = quality)) +
+  geom_boxplot() +
+  coord_flip() +
+  # Reverse order of legend labels to match the flipped y-axis
+  scale_fill_discrete(guide = guide_legend(reverse=TRUE))
+```
+
+We see that there are few large differences between quality 5 and 6. Alcohol and sulphates are the only ones for which at least one of the medians fall outside the interquartile range of the other class, but there is still substantial overlap. Based on this I knew successful prediction would have to rely on quality correlating with interactions between the predictors, if any existed.
+
+I wanted to see if the trends hinted at by comparing 5 and 6 held for the other classes, but since an equivalent plot for all the qualities would be difficult to interpret I instead made one for grouped qualities, defining 3 and 4 as "poor", 5 and 6 as "middling", and 7 and 8 as "good".
+
+```{r Grouping classifications}
+group_quality <- function(q) {
+  if ( q == "3" | q == "4" ) return("poor")
+  else {if (q == "5" | q == "6") return("middling")
+  else return("good")}
+}
+```
+
+```{r Variations in physicochemical measurements between quality groups, fig.cap="Variation in physicochemical measurements between quality groups"}
+# Adding a group quality variable to each observation
+# Specifying order of quality factors to get the correct order in plot.
+normalized %>% mutate(quality_group = factor(sapply(quality, group_quality), levels = c("poor", "middling", "good"))) %>%
+# Plotting the different measurements by quality group
+  ggplot(aes(measurement, value, fill = quality_group)) +
+  geom_boxplot() +
+  coord_flip() +
+  # Reverse y-axis to get elements in alphabetical order from top to bottom
+  scale_fill_discrete(guide = guide_legend(reverse=TRUE))
+```
+
+We see in figure 3 that comparing these three groupings there are more factors that could plausibly have some predictive value and that alcohol and sulphates at least partially have the same trend as we saw comparing just quality 5 and 6.
+
+But we also see that there is a great deal of overlap even for the variables with the most potential.
+
+
+## Modeling
+
+### Error Metrics
+
+There are many error metrics one could use for training models on this data. I chose to use the default metric in caret for each algorithm for training, but to compare the results I used an Regression Error Characteristic (REC), the percentage of predictions where the observed class falls within the range defined by the prediction and a tolerance *T*, with tolerances of .5 (T .5) and 1 (T 1) overall. To see how the algorithms faired on the less prevalent classes I also used **T 1**grouped by the actual class of the observation.
+
+**T .5** is the same as mapping each prediction onto the closest class, **T 1** counts "one-offs" as hits, which makes sense when trying to predict ordinal data and comparing regression and classification.
+
+```{r Function for REC}
+# REC counts as a hit a prediction that falls within 'tolerance' of
+# the actual observation
+# prediction and observation both need to be numerical
+REC <- function(pred, obsv, tolerance = 0.5, list = FALSE) {
+  hits <- vector(length = length(obsv))
+  for (i in 1:length(obsv)) {
+    # Using = for both terms to deal with whole number
+    if (pred[i] >= obsv[i] - tolerance & pred[i] <= obsv[i] + tolerance) {
+      hits[i] <- TRUE
+    } 
+    else hits[i] <- FALSE
+  }
+  if(!list)
+    return(mean(hits))
+  else
+    return(hits)
+}
+```
+
+### Naive approaches
+
+As figure 1 shows, quality 5 and 6, the middling wines, are much more prevalent than the others, with 7 less so but still significantly more prevalent than the others, so a decent model should at least be able to beat a prediction of 6 for all wines. The precise error metrics for using this naive approach to predict the training data are given in tables 1 and 2.
+
+```{r Error characteristics - naive prediction}
+pred <- numeric(length = length(training_data$quality)) + 6
+rec_5 <- REC(pred, training_data$quality, tolerance = 0.5)
+rec_1 <- REC(pred, training_data$quality, tolerance = 1, list = TRUE)
+
+results <- tibble(model = "Naive", 
+                  `T=0.5` = rec_5,
+                  `T=1.0` = mean(rec_1))
+
+rec_class <- training_data %>% mutate(hits = rec_1) %>% group_by(quality) %>% summarize(rec = mean(hits))
+
+results_by_class <- tibble(model = "Naive",
+                           "3" = rec_class[[1,2]],
+                           "4" = rec_class[[2,2]],
+                           "5" = rec_class[[3,2]],
+                           "6" = rec_class[[4,2]],
+                           "7" = rec_class[[5,2]],
+                           "8" = rec_class[[6,2]])
+
+results %>% knitr::kable(digits = 3, caption = "Regression Error Characteristic (tolerances 0.5 and 1.0).")
+results_by_class %>% knitr::kable(digits = 3, caption = "Regression Error Characteristic class (tolerance 1.0)")
+```
+
+If I had only used **T 1** this would have looked like a great model, but its ridiculousness is obvious from looking at the accuracy by class.
+
+### Linear Model
+
+The next step up in complexity is a basic linear model $Y_i = \beta_0 + \beta_1 x_{i,1} + \beta_2 x_{i,2} + ... + \beta_11 x_{i,11}$ with a term for each predictor. Running a linear model in  the training set and predicting on the same set I got the results in tables 3 and 4.
+
+```{r Error characteristics I - linear regression}
+train_lm <- train(quality ~ ., training_data[-13], method = "lm")
+lm_predictions <- predict(train_lm, training_data)
+
+results <- results %>% add_row(model = "Linear Regression",
+                  `T=0.5` = REC(lm_predictions, 
+                                training_data$quality, 
+                                tolerance = 0.5),
+                  `T=1.0` = REC(lm_predictions, 
+                                training_data$quality, 
+                                tolerance = 1))
+
+results %>% knitr::kable(digits = 3, caption = "Mean Absolute Deviation and Regression Error Characteristic (tolerances 0.5 and 1.0).")
+```
+
+```{r Error characteristics II - linear model}
+rec_1 <- REC(lm_predictions, training_data$quality, tolerance = 1, list = TRUE)
+
+rec_class <- training_data %>% mutate(hits = rec_1) %>% group_by(quality) %>% summarize(rec = mean(hits))
+
+results_by_class <- results_by_class %>% add_row(model = "Linear Regression",
+                           "3" = rec_class[[1,2]],
+                           "4" = rec_class[[2,2]],
+                           "5" = rec_class[[3,2]],
+                           "6" = rec_class[[4,2]],
+                           "7" = rec_class[[5,2]],
+                           "8" = rec_class[[6,2]])
+
+results_by_class %>% knitr::kable(digits = 3, caption = "Regression Error Characteristic class (tolerance 1.0)")
+```
+
+From table 3 we see that although we predict the actual class somewhat better through linear regression, the overall accuracy when counting "one-offs" falls slightly. We see this in the per class predictions as well. Some 5s, 6s and nearly 27% of 7s are now predicted more than one class away. Making decisions about the model based on this is slightly risky, since I ran the prediction on the same data set used to train the algorithm, but the sparseness of the data in the least predicted classes make it undesirable to partition the data more than once.
+
+Figure 4. shows the distribution of predictions per observed class. We can see that range of predictions is a lot narrower than the range of observations.
+
+```{r Boxplot of predictions by observed class, fig.cap="Boxplot of predictions by observed class"}
+tibble(class = training_data$quality_factor,
+       prediction = lm_predictions) %>%
+  ggplot(aes(class, prediction)) +
+  geom_boxplot()
+```
+
+### Support Vector Machine with Linear kernel
+
+My next step was to compare the linear approach to using a Support Vector Machine (SVM). This has one tunable parameter, cost, representing the size of the soft margin of the hyperplanes, smaller values mean a larger soft margin.
+
+```{r Training SVM approach with linear kernel, fig.cap = "Cost vs. RMSE for Linear SVM"}
+set.seed(1, sample.kind="Rounding")
+train_svm <- train(quality ~ ., training_data[-13], method = "svmLinear", tuneGrid = data.frame(C = seq(0.001,0.02,0.0005)))
+ggplot(train_svm)
+```
+
+From fig. 5 we see that we get the best result with a cost parameter of `r train_svm$bestTune`.
+
+```{r Error Characteristics - SVM }
+svm_predictions <- predict(train_svm, training_data)
+results <- results %>% add_row(model = "SVM - linear", 
+                              `T=0.5` = REC(svm_predictions, 
+                                          training_data$quality, 
+                                          tolerance = 0.5),
+                              `T=1.0` = REC(svm_predictions, 
+                                            training_data$quality, 
+                                            tolerance = 1))
+
+results %>% knitr::kable(digits = 3, caption = "Regression Error Characteristic (tolerances 0.5 and 1.0).")
+```
+
+As table 5 shows, our overall accuracy goes down a little compared to plain linear regression.
+
+```{r Error characteristics II - SVM linear}
+rec_2 <- REC(svm_predictions, training_data$quality, tolerance = 1, list = TRUE)
+
+rec_2_class <- training_data %>% mutate(hits = rec_2) %>% group_by(quality) %>% summarize(rec = mean(hits))
+
+results_by_class <- results_by_class %>% add_row(model = "SVM Linear",
+                           "3" = rec_2_class[[1,2]],
+                           "4" = rec_2_class[[2,2]],
+                           "5" = rec_2_class[[3,2]],
+                           "6" = rec_2_class[[4,2]],
+                           "7" = rec_2_class[[5,2]],
+                           "8" = rec_2_class[[6,2]])
+
+results_by_class %>% knitr::kable(digits = 3, caption = "Regression Error Characteristic class (tolerance 1.0)")
+```
+
+Looking at table 6 and figure 6 we see that the change in overall accuracy comes from being less accurate for the highest classes.
+
+```{r Boxplot of predictions per class - linear model and svm linear, fig.cap="Boxplot of predictions per class - linear model and svm linear"}
+tibble(class = training_data$quality_factor,
+       lm_prediction = lm_predictions,
+       svm_prediction = svm_predictions) %>%
+  pivot_longer(-class, names_to = "model", values_to = "prediction") %>%
+  ggplot(aes(class, prediction, color = model)) +
+  geom_boxplot()
+```
+
+### SVM Polynomial
+
+A slightly more flexible approach is to use a Support Vector Machine with a polynomial kernel. It is tuned with the same cost parameter, but with the addition of a degree for the polynomial kernel. It has the potential to be more accurate when the hyper-boundaries between classes are more complicated than the linear approach accounts for.
+
+```{r Training an SVM polynomial model, fig.cap = "Tuning parameters for SVM polynomial model"}
+set.seed(1, sample.kind="Rounding")
+tuneGrid = data.frame(C = seq(0.003,0.008,0.001),
+                      degree = c(2, 3),
+                      scale = 1)
+train_svmP <- train(quality ~ ., training_data[-13], method = "svmPoly", tuneGrid = tuneGrid)
+ggplot(train_svmP)
+```
+
+Figure 7 shows that we get the best result with a degree of `r train_svmP$bestTune$degree` and a cost of `r train_svmP$bestTune$C`.
+
+```{r Error characteristics - SVM poly}
+svmP_predictions <- predict(train_svmP, training_data)
+results <- results %>% add_row(model = "SVM poly", 
+                  `T=0.5` = REC(svmP_predictions, 
+                                training_data$quality, 
+                                tolerance = 0.5),
+                  `T=1.0` = REC(svmP_predictions, 
+                                training_data$quality, 
+                                tolerance = 1))
+
+results %>% knitr::kable(digits = 3, caption = "Mean Absolute Deviation and Regression Error Characteristic (tolerances 0.5 and 1.0).")
+```
+```{r Error characteristics II - SVM poly}
+rec_3 <- REC(svmP_predictions, training_data$quality, tolerance = 1, list = TRUE)
+
+rec_3_class <- training_data %>% mutate(hits = rec_3) %>% group_by(quality) %>% summarize(rec = mean(hits))
+
+results_by_class <- results_by_class %>% add_row(model = "SVM Poly",
+                           "3" = rec_3_class[[1,2]],
+                           "4" = rec_3_class[[2,2]],
+                           "5" = rec_3_class[[3,2]],
+                           "6" = rec_3_class[[4,2]],
+                           "7" = rec_3_class[[5,2]],
+                           "8" = rec_3_class[[6,2]])
+
+results_by_class %>% knitr::kable(digits = 3, caption = "Regression Error Characteristic class (tolerance 1.0)")
+```
+
+
+
+Using this model to predict the training data gave tables 7 and 8 showing a significant improvement over the previous models, but as can be seen from table 8, at a cost for the low prevalence quality 4.
+
+### Ordinal Random Forest
+
+The final algorithm I wanted to try is an Ordinal Random Forest (ORF). According to documentation for the package `ordinalForest` the core idea is to assume there is some underlying continuous variable mapping to a known ordinal variable such as the quality in the data set in this report. This means the algorithm not only takes into consideration that predicting a 4 for class 5 is better than 3, but also that, unlike mapping the ordinal variable to a numerical and doing regression, it doesn't assume a quality 6 wine is twice as good as a quality 3 wine, but that there *is* some numerical relationship between them, perhaps it's 20% better, or 150% better. This is likely to be closer to reality than running a regression.
+
+ORF seeks to approximate such an underlying reality by:
+* generating multiple random mappings from ordinal to continuous variable, called score sets, 
+* creating a random forest for each, with a limited number of trees, 
+* picking the best performing score sets and averaging them
+* creating a larger random forest with this optimized score set
+
+In caret the algorithm can be trained on the number of score sets to use initially (*nsets*), the number of trees used to evaluate the score sets (*ntreeperdiv*) and the size of the final random forest (*ntreefinal*).
+
+There is some discrepancy between the documentation for the `ordinalForest` package and `caret`. The default tune grid in caret has ntreeperdiv 50, 100 and 150, ntreefinal 200, 400, 600 and nsets 50, 100, 150. While the `ordinalForest package has defaults 100 (ntreeperdiv), 5000 (ntreefinal) and 1000 (nsets).
+
+Because the algorithm is quite time intensive and more so with large values I chose to run with the defaults in caret initially and then narrowed it in somewhat to get the results shown in fig 8.
+
+```{r tuning ordinal random forest, fig.cap="Tuning Ordinal Random Forest"}
+set.seed(100, sample.kind = "Rounding")
+tuneGrid = expand.grid(nsets = seq(50, 150, 100),
+                       ntreeperdiv = seq(50, 250, 100),
+                       ntreefinal = seq(500, 700, 100))
+train_orf <- train(quality_factor ~ ., training_data[-12], method = "ordinalRF", tuneGrid = tuneGrid)
+ggplot(train_orf)
+```
+
+Using the best tune from this figure, I got the results shown in table 9, but the near perfect classification on predicting the algorithm's input shows that this was not a valid comparison to the previous algorithms. However, since this algorithm trains on class accuracy we can compare the accuracy of the best tune (abt. 0.668) with the average bootstrap of 0.631 which was our best *T 0.5* so far.
+
+```{r Error Characteristics - ORF}
+orf_predictions <- as.numeric(as.character(predict(train_orf, training_data)))
+results <- results %>% add_row(model = "ORF", 
+                  `T=0.5` = REC(orf_predictions, 
+                                training_data$quality, 
+                                tolerance = 0.5),
+                  `T=1.0` = REC(orf_predictions, 
+                                training_data$quality, 
+                                tolerance = 1.01))
+
+results %>% knitr::kable(digits = 3, caption = "Mean Absolute Deviation and Regression Error Characteristic (tolerances 0.5 and 1.0).")
+```
+
+```{r Box plot comparing SVM - polynomial and Ordinal Random Forest, fig.cap= "Prediction on the training set by SVM-poly and Ordinal Random Forest"}
+tibble(class = training_data$quality_factor,
+       svmp_prediction = svmP_predictions,
+       orf_prediction = orf_predictions) %>%
+  pivot_longer(-class, names_to = "model", values_to = "prediction") %>%
+  ggplot(aes(class, prediction, color = model)) +
+  geom_boxplot()
+```
+
+The big disparity between the accuracy we get on the bootstrap samples, and what we get when predicting the whole training set by itself indicates the algorithm is overfitting, which we also see in fig. 9. I looked into different possible ways to deal with this, such as setting samples per node higher, but I thought that would be problematic for the tiny class size for quality 3. So instead I tried reducing the size of the final forest, since it appeared from the results of training I did that smaller final forests were not much worse, and for some values of the other parameters actually better, than larger. I chose to tune again only on final trees and set both nsets and ntreeperdiv fixed at 50, since those gave relatively good results for the lowest number of trees in the previous training grid, and I tried final forests between 200 and 500. The training result is shown in fig. 10.
+
+```{r Training Ordinal Random Forest - smaller forests, fig.cap="Training Ordinal Random forest with smaller forests"}
+set.seed(100, sample.kind = "Rounding" )
+tuneGrid = expand.grid(nsets = 50, 
+                       ntreeperdiv = 50,
+                       ntreefinal = seq(200, 500, 50))
+train_orf_smaller <- train(quality_factor ~ ., training_data[-12], method = "ordinalRF", tuneGrid = tuneGrid)
+ggplot(train_orf_smaller)
+```
+
+The best tunes training with those parameters were only marginally worse than the previous best, despite having fewer trees in the final forest. There was a lot of variation though, with a forest of only 250 having nearly as good results as one with 400 trees, so I plotted them again with errors bars representing one standard deviation, as shown in fig. 11
+
+```{r Training Ordinal Random Forest - smaller forests - results with error bars, fig.cap="Training results with error bars for smaller forests"}
+train_orf_smaller$results %>% ggplot(aes(x = ntreefinal, y = Accuracy,ymax = Accuracy + AccuracySD, ymin = Accuracy - AccuracySD)) +
+  geom_point() +
+  geom_errorbar()
+```
+
+This showed that even for the smallest forests in this tune range, results were statistically equivalent to the larger. So I ran train one final time for even smaller forests (fig 12.).
+
+```{r Training Ordinal Random Forest - tiny forests, fig.cap="Training Ordinal Random forest with tiny forests"}
+set.seed(100, sample.kind = "Rounding" )
+tuneGrid = expand.grid(nsets = 50, 
+                       ntreeperdiv = 50,
+                       ntreefinal = seq(50, 250, 25))
+train_orf_tiny <- train(quality_factor ~ ., training_data[-12], method = "ordinalRF", tuneGrid = tuneGrid)
+ggplot(train_orf_tiny)
+```
+
+```{r Error Characteristics - ORF small and tiny forest}
+orf_predictions_smaller <- as.numeric(as.character(predict(train_orf_smaller, training_data)))
+results <- results %>% add_row(model = "ORF - smaller", 
+                  `T=0.5` = REC(orf_predictions_smaller, 
+                                training_data$quality, 
+                                tolerance = 0.5),
+                  `T=1.0` = REC(orf_predictions_smaller, 
+                                training_data$quality, 
+                                tolerance = 1.01))
+
+orf_predictions_tiny <- as.numeric(as.character(predict(train_orf_smaller, training_data)))
+results <- results %>% add_row(model = "ORF - tiny", 
+                  `T=0.5` = REC(orf_predictions_tiny, 
+                                training_data$quality, 
+                                tolerance = 0.5),
+                  `T=1.0` = REC(orf_predictions_tiny, 
+                                training_data$quality, 
+                                tolerance = 1.01))
+
+results %>% knitr::kable(digits = 3, caption = "Mean Absolute Deviation and Regression Error Characteristic (tolerances 0.5 and 1.0).")
+```
+
+Using the best tunes with the smaller forests still gave near perfect predictions on the training set (table 10), but the tuning plot showed a more consistent increase in accuracy towards the larger forests in that range. And the maximum accuracy was almost as good as for a much larger forest.
+
+# Results
+
+Although the results for Ordinal Forests predicting on the training set did appear to show overfitting I still believed it had the potential to be an improvement over the simpler models, because it showed the ability to predict 3s and 8s, where the others had predictions almost entirely confined to the interval 4.5 - 7. So I chose to not experiment with more algorithms but to run my final tests with the reserved test data.
+
+The outcomes for all the algorithms predicting the test data is shown in tables 11 and 12.
+
+```{r Predictions on test data for all trained models}
+# Creating tibbles for results and evaluating predictions on 
+# linear model with test data
+lm_predictions_test <- predict(train_lm, test_data)
+
+results_final <- tibble(model = "Linear Regression",
+                  `T=0.5` = REC(lm_predictions_test, 
+                                test_data$quality, 
+                                tolerance = 0.5),
+                  `T=1.0` = REC(lm_predictions_test, 
+                                test_data$quality, 
+                                tolerance = 1))
+
+rec_1 <- REC(lm_predictions_test, test_data$quality, tolerance = 1, list = TRUE)
+
+rec_class <- test_data %>% mutate(hits = rec_1) %>% group_by(quality) %>% summarize(rec = mean(hits))
+
+results_by_class_final <- tibble(model = "Linear Regression",
+                           "3" = rec_class[[1,2]],
+                           "4" = rec_class[[2,2]],
+                           "5" = rec_class[[3,2]],
+                           "6" = rec_class[[4,2]],
+                           "7" = rec_class[[5,2]],
+                           "8" = rec_class[[6,2]])
+
+# Adding results from predicting on test data for SVM linear
+svm_predictions_test <- predict(train_svm, test_data)
+results_final <- results_final %>% add_row(model = "SVM - linear", 
+                              `T=0.5` = REC(svm_predictions_test, 
+                                          test_data$quality, 
+                                          tolerance = 0.5),
+                              `T=1.0` = REC(svm_predictions_test, 
+                                            test_data$quality, 
+                                            tolerance = 1))
+
+rec_2 <- REC(svm_predictions_test, test_data$quality, tolerance = 1, list = TRUE)
+
+rec_2_class <- test_data %>% mutate(hits = rec_2) %>% group_by(quality) %>% summarize(rec = mean(hits))
+
+results_by_class_final <- results_by_class_final %>% add_row(model = "SVM Linear",
+                           "3" = rec_2_class[[1,2]],
+                           "4" = rec_2_class[[2,2]],
+                           "5" = rec_2_class[[3,2]],
+                           "6" = rec_2_class[[4,2]],
+                           "7" = rec_2_class[[5,2]],
+                           "8" = rec_2_class[[6,2]])
+
+# Adding results from predicting on test data for SVM polynomial
+svmP_predictions_test <- predict(train_svmP, test_data)
+results_final <- results_final %>% add_row(model = "SVM - polynomial", 
+                              `T=0.5` = REC(svmP_predictions_test, 
+                                          test_data$quality, 
+                                          tolerance = 0.5),
+                              `T=1.0` = REC(svmP_predictions_test, 
+                                            test_data$quality, 
+                                            tolerance = 1))
+
+rec_3 <- REC(svmP_predictions_test, test_data$quality, tolerance = 1, list = TRUE)
+
+rec_3_class <- test_data %>% mutate(hits = rec_3) %>% group_by(quality) %>% summarize(rec = mean(hits))
+
+results_by_class_final <- results_by_class_final %>% add_row(model = "SVM polynomial",
+                           "3" = rec_3_class[[1,2]],
+                           "4" = rec_3_class[[2,2]],
+                           "5" = rec_3_class[[3,2]],
+                           "6" = rec_3_class[[4,2]],
+                           "7" = rec_3_class[[5,2]],
+                           "8" = rec_3_class[[6,2]])
+
+# Adding results from predicting on test data for ORF forest
+orf_predictions_test <- as.numeric(as.character(predict(train_orf, test_data)))
+results_final <- results_final %>% add_row(model = "ORF", 
+                              `T=0.5` = REC(orf_predictions_test, 
+                                          test_data$quality, 
+                                          tolerance = 0.5),
+                              `T=1.0` = REC(orf_predictions_test, 
+                                            test_data$quality, 
+                                            tolerance = 1))
+
+rec_4 <- REC(orf_predictions_test, test_data$quality, tolerance = 1, list = TRUE)
+
+rec_4_class <- test_data %>% mutate(hits = rec_4) %>% group_by(quality) %>% summarize(rec = mean(hits))
+
+results_by_class_final <- results_by_class_final %>% add_row(model = "ORF",
+                           "3" = rec_4_class[[1,2]],
+                           "4" = rec_4_class[[2,2]],
+                           "5" = rec_4_class[[3,2]],
+                           "6" = rec_4_class[[4,2]],
+                           "7" = rec_4_class[[5,2]],
+                           "8" = rec_4_class[[6,2]])
+
+# Adding results from predicting on test data for ORF - smaller forest
+orf_predictions_smaller_test <- as.numeric(as.character(predict(train_orf_smaller, test_data)))
+results_final <- results_final %>% add_row(model = "ORF - smaller", 
+                              `T=0.5` = REC(orf_predictions_smaller_test, 
+                                          test_data$quality, 
+                                          tolerance = 0.5),
+                              `T=1.0` = REC(orf_predictions_smaller_test, 
+                                            test_data$quality, 
+                                            tolerance = 1))
+
+rec_5 <- REC(orf_predictions_smaller_test, test_data$quality, tolerance = 1, list = TRUE)
+
+rec_5_class <- test_data %>% mutate(hits = rec_5) %>% group_by(quality) %>% summarize(rec = mean(hits))
+
+results_by_class_final <- results_by_class_final %>% add_row(model = "ORF - smaller",
+                           "3" = rec_5_class[[1,2]],
+                           "4" = rec_5_class[[2,2]],
+                           "5" = rec_5_class[[3,2]],
+                           "6" = rec_5_class[[4,2]],
+                           "7" = rec_5_class[[5,2]],
+                           "8" = rec_5_class[[6,2]])
+
+# Adding results from predicting on test data for ORF - tiny forest
+orf_predictions_tiny_test <- as.numeric(as.character(predict(train_orf_tiny, test_data)))
+results_final <- results_final %>% add_row(model = "ORF - tiny", 
+                              `T=0.5` = REC(orf_predictions_tiny_test, 
+                                          test_data$quality, 
+                                          tolerance = 0.5),
+                              `T=1.0` = REC(orf_predictions_tiny_test, 
+                                            test_data$quality, 
+                                            tolerance = 1))
+
+rec_5 <- REC(orf_predictions_tiny_test, test_data$quality, tolerance = 1, list = TRUE)
+
+rec_5_class <- test_data %>% mutate(hits = rec_5) %>% group_by(quality) %>% summarize(rec = mean(hits))
+
+results_by_class_final <- results_by_class_final %>% add_row(model = "ORF - tiny",
+                           "3" = rec_5_class[[1,2]],
+                           "4" = rec_5_class[[2,2]],
+                           "5" = rec_5_class[[3,2]],
+                           "6" = rec_5_class[[4,2]],
+                           "7" = rec_5_class[[5,2]],
+                           "8" = rec_5_class[[6,2]])
+
+results_final %>% knitr::kable(digits = 3, caption = "Regression Error Characteristic (tolerances 0.5 and 1.0).")
+results_by_class_final %>% knitr::kable(digits = 3, caption = "Regression Error Characteristic class (tolerance 1.0)")
+```
+
+As predicted by the results from training, the ORF models are more accurate overall when accepting one off errors, also on the test data. And as I expected due to them predicting more of the extreme values, they are also more accurate for every class. The smallest forrests performed very similarly or even better than the larger, lending support to my assumption that reducing the size of the forest could decrease overfitting, but it bears repeating though that in the test set there is only one wine of quality 3 and two of quality 8.
+
+# Conclusion
+
+In this report I have shown the results of trying to predict Wine Quality scores from the Viticulture Commission of the Vinho Verde region using physicochemical properties of the wines measured during the certification process. I've shown that using SVM with a linear or quadratic kernel offers minimal improvement over linear regression and has problems with this specific dataset due to the qualities being ordinal data and due to the high prevalence of middling qualities. I have further shown that at an algorithm specifically designed to make predictions on ordinal data, the Ordinal Forest approach, outperforms these regression approaches.
+
+Although the final algorithms appear to perform well based on the error metric I set out to judge them by, it is possible further improvement could have been made by training based on them, instead of by overall accuracy. Determining if that is the case would have required a much closer look at the Ordinal Forest algorithm.
+
+# References
+
+Dua, D. and Graff, C. (2019). 
+UCI Machine Learning Repository http://archive.ics.uci.edu/ml . 
+Irvine, CA: University of California, School of Information and Computer Science.
+
+P. Cortez, A. Cerdeira, F. Almeida, T. Matos and J. Reis (2009).
+*Wine Quality Data Set*
+UCI Machine Learning Repository, Dataset, 25 Nov 2019, 
+https://archive.ics.uci.edu/ml/datasets/Wine+Quality .
+
+P. Cortez, A. Cerdeira, F. Almeida, T. Matos and J. Reis (2009).
+‘Modeling wine preferences by data mining from physicochemical properties [Preprint]’. To be published in *Decision Support Systems*.
+Available at: http://repositorium.sdum.uminho.pt/bitstream/1822/10029/1/wine5.pdf (Accessed: 25 Nov 2019).
