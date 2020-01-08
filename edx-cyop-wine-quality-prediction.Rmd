@@ -1,7 +1,7 @@
 ---
 title: "Predicting wine quality from physicochemical properties"
 author: "Bjoernar Tuftin"
-date: "October 25, 2019"
+date: "January 8, 2020"
 output: pdf_document
 ---
 
@@ -58,6 +58,9 @@ For the Ordinal Forest algorithm though, predicting on the training set gave a n
 Based on the error characteristics I was using I couldn't be certain it was successful, but it seemed like a plausible approach and I chose a forest size that only reduced the overall accuracy on the bootstraps by an amount withing a standard deviation of the best and then moved to validating the final models by predicting on the reserved test set. 
 
 This showed that the Ordinal Forest algorithm still outperformed the other algorithms. My attempts at reducing overfitting appeared to, at best, have had only a minuscule positive effect, but, as expected based on the results in training, they definitely represent a simplification of the model with insignificant loss of accuracy.
+
+A copy of the .Rmd-file used to generate this report can be found at:
+https://github.com/btuftin/edx-cyop-wine-quality-prediction
 
 # Method and Analysis
 
